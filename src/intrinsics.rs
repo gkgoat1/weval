@@ -29,12 +29,12 @@ pub(crate) struct Intrinsics {
 impl Intrinsics {
     pub(crate) fn find(module: &Module) -> Intrinsics {
         Intrinsics {
-            read_reg: find_imported_intrinsic(module, "read.reg", &[Type::I64], &[Type::I64]),
-            write_reg: find_imported_intrinsic(module, "write.reg", &[Type::I64, Type::I64], &[]),
-            push_context: find_imported_intrinsic(module, "push.context", &[Type::I32], &[]),
-            pop_context: find_imported_intrinsic(module, "pop.context", &[], &[]),
-            update_context: find_imported_intrinsic(module, "update.context", &[Type::I32], &[]),
-            context_bucket: find_imported_intrinsic(module, "context.bucket", &[Type::I32], &[]),
+            read_reg: find_imported_intrinsic(module, "read.reg", &[Type::I32, Type::I64], &[Type::I64]),
+            write_reg: find_imported_intrinsic(module, "write.reg", &[Type::I32, Type::I64, Type::I64], &[]),
+            push_context: find_imported_intrinsic(module, "push.context", &[Type::I32, Type::I32], &[]),
+            pop_context: find_imported_intrinsic(module, "pop.context", &[Type::I32, ], &[]),
+            update_context: find_imported_intrinsic(module, "update.context", &[Type::I32, Type::I32], &[]),
+            context_bucket: find_imported_intrinsic(module, "context.bucket", &[Type::I32, Type::I32], &[]),
             abort_specialization: find_imported_intrinsic(
                 module,
                 "abort.specialization",
@@ -51,7 +51,7 @@ impl Intrinsics {
             assert_specialized: find_imported_intrinsic(
                 module,
                 "assert.specialized",
-                &[Type::I32],
+                &[Type::I32, Type::I32],
                 &[],
             ),
             specialize_value: find_imported_intrinsic(
@@ -73,31 +73,31 @@ impl Intrinsics {
                 &[Type::I64],
             ),
 
-            push_stack: find_imported_intrinsic(module, "push.stack", &[Type::I32, Type::I64], &[]),
-            sync_stack: find_imported_intrinsic(module, "sync.stack", &[], &[]),
+            push_stack: find_imported_intrinsic(module, "push.stack", &[Type::I32, Type::I32, Type::I64], &[]),
+            sync_stack: find_imported_intrinsic(module, "sync.stack", &[Type::I32, ], &[]),
             read_stack: find_imported_intrinsic(
                 module,
                 "read.stack",
-                &[Type::I32, Type::I32],
+                &[Type::I32, Type::I32, Type::I32],
                 &[Type::I64],
             ),
             write_stack: find_imported_intrinsic(
                 module,
                 "write.stack",
-                &[Type::I32, Type::I32, Type::I64],
+                &[Type::I32, Type::I32, Type::I32, Type::I64],
                 &[],
             ),
-            pop_stack: find_imported_intrinsic(module, "pop.stack", &[Type::I32], &[Type::I64]),
+            pop_stack: find_imported_intrinsic(module, "pop.stack", &[Type::I32, Type::I32], &[Type::I64]),
             read_local: find_imported_intrinsic(
                 module,
                 "read.local",
-                &[Type::I32, Type::I32],
+                &[Type::I32, Type::I32, Type::I32],
                 &[Type::I64],
             ),
             write_local: find_imported_intrinsic(
                 module,
                 "write.local",
-                &[Type::I32, Type::I32, Type::I64],
+                &[Type::I32, Type::I32, Type::I32, Type::I64],
                 &[],
             ),
         }

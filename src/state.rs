@@ -43,6 +43,12 @@ use waffle::entity::{EntityRef, EntityVec, PerEntity};
 use waffle::{Block, FunctionBody, Global, Type, Value};
 
 waffle::declare_entity!(Context, "context");
+waffle::declare_entity!(Key, "key");
+impl Key{
+    pub(crate) fn new(a: u32) -> Self{
+        Self(a)
+    }
+}
 
 pub(crate) type PC = u32;
 
@@ -108,19 +114,19 @@ pub(crate) struct ProgPointState {
     /// definitions and merging takes a common prefix).
     ///
     /// Each entry is an (address, data) pair.
-    pub stack: Vec<(RegValue, RegValue)>,
+    pub stack: BTreeMap<Key, Vec<(RegValue, RegValue)>>,
     /// Virtualized locals, with (address, data) pairs for spilling
     /// back to memory at sync points.
-    pub locals: BTreeMap<u32, (RegValue, RegValue)>,
+    pub locals: BTreeMap<Key, BTreeMap<u32, (RegValue, RegValue)>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum RegSlot {
-    Register(u32),
-    LocalAddr(u32),
-    LocalData(u32),
-    StackData(u32),
-    StackAddr(u32),
+    Register(u32, Key),
+    LocalAddr(u32, Key),
+    LocalData(u32, Key),
+    StackData(u32, Key),
+    StackAddr(u32, Key),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -198,7 +204,7 @@ impl RegValue {
 /// The state for a function body during analysis.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct FunctionState {
-    pub contexts: Contexts,
+    pub contexts: EntityVec<Key, Contexts>,
     /// AbstractValues in specialized function, indexed by specialized
     /// Value.
     pub values: PerEntity<Value, AbstractValue>,
@@ -213,8 +219,8 @@ pub(crate) struct FunctionState {
 /// State carried during a pass through a block.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PointState {
-    pub context: Context,
-    pub pending_context: Option<Context>,
+    pub context: BTreeMap<Key, Context>,
+    pub pending_context: Option<BTreeMap<Key, Context>>,
     pub pending_specialize: Option<(Value, u32, u32)>,
     pub flow: ProgPointState,
 }
@@ -295,7 +301,7 @@ impl ProgPointState {
         ProgPointState {
             regs: BTreeMap::new(),
             globals,
-            stack: vec![],
+            stack: BTreeMap::new(),
             locals: BTreeMap::new(),
         }
     }
@@ -310,26 +316,50 @@ impl ProgPointState {
             AbstractValue::meet,
             Some(AbstractValue::Runtime(None)),
         );
-
-        if other.stack.len() < self.stack.len() {
-            changed = true;
-            self.stack.truncate(other.stack.len());
+        for k in self
+            .stack
+            .keys()
+            .chain(other.stack.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>()
+        {
+            let stack = self.stack.entry(k).or_default();
+            let Some(other_stack) = other.stack.get(&k) else {
+                changed = true;
+                continue;
+            };
+            if other_stack.len() < stack.len() {
+                changed = true;
+                stack.truncate(other_stack.len());
+            }
+            for (this, other) in stack.iter_mut().zip(other_stack.iter()) {
+                let new_addr = RegValue::meet(&this.0, &other.0);
+                changed |= new_addr != this.0;
+                this.0 = new_addr;
+                let new_data = RegValue::meet(&this.1, &other.1);
+                changed |= new_data != this.1;
+                this.1 = new_data;
+            }
         }
-        for (this, other) in self.stack.iter_mut().zip(other.stack.iter()) {
-            let new_addr = RegValue::meet(&this.0, &other.0);
-            changed |= new_addr != this.0;
-            this.0 = new_addr;
-            let new_data = RegValue::meet(&this.1, &other.1);
-            changed |= new_data != this.1;
-            this.1 = new_data;
+        for k in self
+            .locals
+            .keys()
+            .chain(other.locals.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>()
+        {
+            let locals = self.locals.entry(k).or_default();
+            let Some(other_locals) = other.locals.get(&k) else {
+                changed = true;
+                continue;
+            };
+            changed |= map_meet_with(
+                locals,
+                other_locals,
+                |(a0, a1), (b0, b1)| (RegValue::meet(a0, b0), RegValue::meet(a1, b1)),
+                None,
+            );
         }
-
-        changed |= map_meet_with(
-            &mut self.locals,
-            &other.locals,
-            |(a0, a1), (b0, b1)| (RegValue::meet(a0, b0), RegValue::meet(a1, b1)),
-            None,
-        );
 
         changed
     }
@@ -349,13 +379,17 @@ impl ProgPointState {
         for value in self.regs.values_mut() {
             create_merge(value);
         }
-        for (addr, data) in &mut self.stack {
-            create_merge(addr);
-            create_merge(data);
+        for (key, value) in &mut self.stack {
+            for (addr, data) in value {
+                create_merge(addr);
+                create_merge(data);
+            }
         }
-        for (addr, data) in self.locals.values_mut() {
-            create_merge(addr);
-            create_merge(data);
+        for (key, value) in &mut self.locals {
+            for (addr, data) in value.values_mut() {
+                create_merge(addr);
+                create_merge(data);
+            }
         }
     }
 
@@ -378,13 +412,17 @@ impl ProgPointState {
         for (&idx, value) in &mut self.regs {
             handle_value(idx, value);
         }
-        for (i, (addr, data)) in self.stack.iter_mut().enumerate() {
-            handle_value(RegSlot::StackAddr(i as u32), addr);
-            handle_value(RegSlot::StackData(i as u32), data);
+        for (key, value) in &mut self.stack {
+            for (i, (addr, data)) in value.iter_mut().enumerate() {
+                handle_value(RegSlot::StackAddr(i as u32, *key), addr);
+                handle_value(RegSlot::StackData(i as u32, *key), data);
+            }
         }
-        for (i, (addr, value)) in self.locals.iter_mut() {
-            handle_value(RegSlot::LocalAddr(*i), addr);
-            handle_value(RegSlot::LocalData(*i), value);
+        for (key, value) in &mut self.locals {
+            for (i, (addr, value)) in value.iter_mut() {
+                handle_value(RegSlot::LocalAddr(*i, *key), addr);
+                handle_value(RegSlot::LocalData(*i, *key), value);
+            }
         }
 
         Ok(())
@@ -396,18 +434,13 @@ impl FunctionState {
         FunctionState::default()
     }
 
-    pub(crate) fn init(&mut self, im: &Image) -> (Context, ProgPointState) {
-        let ctx = self.contexts.create(None, ContextElem::Root);
-        (ctx, ProgPointState::entry(im))
-    }
-
     pub(crate) fn set_args(
         &mut self,
         orig_body: &FunctionBody,
         num_globals: usize,
         args: &[AbstractValue],
-        ctx: Context,
-        value_map: &HashMap<(Context, Value), Value>,
+        ctx: BTreeMap<Key, Context>,
+        value_map: &HashMap<(BTreeMap<Key,Context>, Value), Value>,
     ) {
         // For each blockparam of the entry block, set the value of the SSA arg.
         debug_assert_eq!(args.len(), orig_body.blocks[orig_body.entry].params.len());
@@ -416,7 +449,7 @@ impl FunctionState {
             .iter()
             .zip(args.iter().skip(num_globals))
         {
-            let spec_value = *value_map.get(&(ctx, *orig_value)).unwrap();
+            let spec_value = *value_map.get(&(ctx.clone(), *orig_value)).unwrap();
             self.values[spec_value] = abs.clone();
         }
 

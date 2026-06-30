@@ -12,6 +12,7 @@ use fxhash::FxHashMap as HashMap;
 use fxhash::FxHashSet as HashSet;
 use rayon::prelude::*;
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::collections::{hash_map::Entry as HashEntry, BTreeSet, VecDeque};
 use std::sync::Mutex;
 use waffle::{
@@ -43,21 +44,21 @@ struct Evaluator<'a> {
     /// New function body.
     func: FunctionBody,
     /// Map of (ctx, block_in_generic) to specialized block_in_func.
-    block_map: HashMap<(Context, Block), Block>,
+    block_map: HashMap<(BTreeMap<Key, Context>, Block), Block>,
     /// Reverse map from specialized block to its original ctx/block.
-    block_rev_map: PerEntity<Block, (Context, Block)>,
+    block_rev_map: PerEntity<Block, (BTreeMap<Key, Context>, Block)>,
     /// Map of (ctx, value_in_generic) to specialized value_in_func.
-    value_map: HashMap<(Context, Value), Value>,
+    value_map: HashMap<(BTreeMap<Key, Context>, Value), Value>,
     /// Dependency map from a given value to any blocks (in
     /// specialized function) that must be re-evaluated if it changes.
-    value_dep_blocks: HashMap<(Context, Value), BTreeSet<Block>>,
+    value_dep_blocks: HashMap<(BTreeMap<Key, Context>, Value), BTreeSet<Block>>,
     /// Map of (ctx, block, idx) to blockparams for specialization-register values.
-    reg_map: HashMap<(Context, Block, RegSlot), Value>,
+    reg_map: HashMap<(BTreeMap<Key, Context>, Block, RegSlot), Value>,
     /// Queue of blocks to (re)compute. List of (block_in_generic,
     /// ctx, block_in_func).
-    queue: VecDeque<(Block, Context, Block)>,
+    queue: VecDeque<(Block, BTreeMap<Key, Context>, Block)>,
     /// Set to deduplicate `queue`.
-    queue_set: HashSet<(Block, Context)>,
+    queue_set: HashSet<(Block, BTreeMap<Key, Context>)>,
     /// Stats accumulated during specialization.
     stats: SpecializationStats,
 }
@@ -330,19 +331,22 @@ fn partially_evaluate_func(
         queue_set: HashSet::default(),
         stats: SpecializationStats::default(),
     };
-    let (ctx, entry_state) = evaluator.state.init(image);
+    let entry_state = ProgPointState::entry(image);
     log::trace!("after init_args, state is {:?}", evaluator.state);
 
-    let specialized_entry = evaluator.create_block(evaluator.generic.entry, ctx, entry_state);
+    let specialized_entry =
+        evaluator.create_block(evaluator.generic.entry, BTreeMap::new(), entry_state);
     evaluator
         .queue
-        .push_back((evaluator.generic.entry, ctx, specialized_entry));
-    evaluator.queue_set.insert((evaluator.generic.entry, ctx));
+        .push_back((evaluator.generic.entry, BTreeMap::new(), specialized_entry));
+    evaluator
+        .queue_set
+        .insert((evaluator.generic.entry, BTreeMap::new()));
     evaluator.state.set_args(
         evaluator.generic,
         evaluator.directive.num_globals as usize,
         &evaluator.directive_args.const_params[..],
-        ctx,
+        BTreeMap::new(),
         &evaluator.value_map,
     );
 
@@ -586,7 +590,7 @@ impl<'a> Evaluator<'a> {
                 );
                 return Ok(false);
             }
-            self.queue_set.remove(&(orig_block, ctx));
+            self.queue_set.remove(&(orig_block, ctx.clone()));
             self.evaluate_block(orig_block, ctx, new_block)?;
         }
         self.finalize()?;
@@ -596,19 +600,22 @@ impl<'a> Evaluator<'a> {
     fn evaluate_block(
         &mut self,
         orig_block: Block,
-        ctx: Context,
+        ctx: BTreeMap<Key, Context>,
         new_block: Block,
     ) -> anyhow::Result<()> {
         // Clear the block body each time we rebuild it -- we may be
         // recomputing a specialization with an existing output.
         self.func.blocks[new_block].insts.clear();
 
-        log::trace!("evaluate_block: orig {orig_block} ctx {ctx} new {new_block}");
-        debug_assert_eq!(self.block_map.get(&(ctx, orig_block)), Some(&new_block));
+        log::trace!("evaluate_block: orig {orig_block} ctx {ctx:?} new {new_block}");
+        debug_assert_eq!(
+            self.block_map.get(&(ctx.clone(), orig_block)),
+            Some(&new_block)
+        );
 
         // Create program-point state.
         let mut state = PointState {
-            context: ctx,
+            context: ctx.clone(),
             pending_context: None,
             pending_specialize: None,
             flow: self.state.block_entry[new_block].clone(),
@@ -619,11 +626,11 @@ impl<'a> Evaluator<'a> {
             &mut self.reg_map,
             &mut |reg_map, regslot, ty| {
                 *reg_map
-                    .entry((ctx, orig_block, regslot))
+                    .entry((ctx.clone(), orig_block, regslot))
                     .or_insert_with(|| {
                         let param = self.func.add_placeholder(ty);
                         log::trace!(
-                            "new blockparam {param} of ty {ty:?} for reg slot {regslot:?} on block {new_block} (ctx {ctx} orig {orig_block})",
+                            "new blockparam {param} of ty {ty:?} for reg slot {regslot:?} on block {new_block} (ctx {ctx:?} orig {orig_block})",
                         );
                         param
                     })
@@ -656,39 +663,39 @@ impl<'a> Evaluator<'a> {
     /// and SSA value in the specialized function.
     fn use_value(
         &mut self,
-        context: Context,
+        context: BTreeMap<Key, Context>,
         orig_block: Block,
         new_block: Block,
         orig_val: Value,
     ) -> (Value, AbstractValue) {
-        log::trace!("using value {orig_val} at block {orig_block} in context {context}");
-        if let Some(&val) = self.value_map.get(&(context, orig_val)) {
+        log::trace!("using value {orig_val} at block {orig_block} in context {context:?}");
+        if let Some(&val) = self.value_map.get(&(context.clone(), orig_val)) {
             if self.cfg.def_block[orig_val] != orig_block {
                 self.value_dep_blocks
-                    .entry((context, orig_val))
+                    .entry((context.clone(), orig_val))
                     .or_default()
                     .insert(new_block);
             }
             let abs = &self.state.values[val];
-            log::trace!(" -> found abstract  value {abs:?} at context {context}");
+            log::trace!(" -> found abstract  value {abs:?} at context {context:?}");
             log::trace!(" -> runtime value {val}");
             return (val, abs.clone());
         }
-        panic!("Could not find value for {orig_val} in context {context}");
+        panic!("Could not find value for {orig_val} in context {context:?}");
     }
 
     fn def_value(
         &mut self,
         block: Block,
-        context: Context,
+        context: BTreeMap<Key, Context>,
         orig_val: Value,
         val: Value,
         abs: AbstractValue,
     ) -> bool {
         log::debug!(
-            "defining val {orig_val} in block {block} context {context} with specialized val {val} abs {abs:?}"
+            "defining val {orig_val} in block {block} context {context:?} with specialized val {val} abs {abs:?}"
         );
-        self.value_map.insert((context, orig_val), val);
+        self.value_map.insert((context.clone(), orig_val), val);
         let val_abs = &mut self.state.values[val];
         let updated = AbstractValue::meet(val_abs, &abs);
         let changed = updated != *val_abs;
@@ -698,11 +705,11 @@ impl<'a> Evaluator<'a> {
         *val_abs = updated;
 
         if changed {
-            if let Some(deps) = self.value_dep_blocks.get(&(context, orig_val)) {
+            if let Some(deps) = self.value_dep_blocks.get(&(context.clone(), orig_val)) {
                 for &new_block in deps {
-                    let (ctx, block) = self.block_rev_map[new_block];
-                    if self.queue_set.insert((block, ctx)) {
-                        self.queue.push_back((block, ctx, new_block));
+                    let (ctx, block) = &self.block_rev_map[new_block];
+                    if self.queue_set.insert((*block, ctx.clone())) {
+                        self.queue.push_back((*block, ctx.clone(), new_block));
                     }
                 }
             }
@@ -711,10 +718,10 @@ impl<'a> Evaluator<'a> {
         changed
     }
 
-    fn enqueue_block_if_existing(&mut self, orig_block: Block, context: Context) {
-        if let Some(block) = self.block_map.get(&(context, orig_block)).copied() {
-            if self.queue_set.insert((orig_block, context)) {
-                self.queue.push_back((orig_block, context, block));
+    fn enqueue_block_if_existing(&mut self, orig_block: Block, context: BTreeMap<Key, Context>) {
+        if let Some(block) = self.block_map.get(&(context.clone(), orig_block)).copied() {
+            if self.queue_set.insert((orig_block, context.clone())) {
+                self.queue.push_back((orig_block, context.clone(), block));
             }
         }
     }
@@ -731,9 +738,9 @@ impl<'a> Evaluator<'a> {
         log::trace!("evaluate_block_body: {orig_block}: state {state:?}");
 
         for &inst in &self.generic.blocks[orig_block].insts {
-            let input_ctx = state.context;
+            let input_ctx = state.context.clone();
             log::trace!(
-                "inst {} in context {} -> {:?}",
+                "inst {} in context {:?} -> {:?}",
                 inst,
                 input_ctx,
                 self.generic.values[inst]
@@ -748,7 +755,8 @@ impl<'a> Evaluator<'a> {
                 }
                 ValueDef::PickOutput(val, idx, ty) => {
                     // Directly transcribe.
-                    let (val, _) = self.use_value(state.context, orig_block, new_block, *val);
+                    let (val, _) =
+                        self.use_value(state.context.clone(), orig_block, new_block, *val);
                     Some((
                         ValueDef::PickOutput(val, *idx, *ty),
                         AbstractValue::Runtime(Some(inst)),
@@ -765,7 +773,8 @@ impl<'a> Evaluator<'a> {
                         log::trace!(" * arg {arg}");
                         let arg = self.generic.resolve_alias(arg);
                         log::trace!(" -> resolves to arg {arg}");
-                        let (val, abs) = self.use_value(state.context, orig_block, new_block, arg);
+                        let (val, abs) =
+                            self.use_value(state.context.clone(), orig_block, new_block, arg);
                         arg_abs_values.push(abs);
                         self.func.arg_pool[arg_values][i] = val;
                     }
@@ -844,11 +853,18 @@ impl<'a> Evaluator<'a> {
                 ),
             } {
                 let result_value = self.func.add_value(result_value);
-                self.value_map.insert((input_ctx, inst), result_value);
+                self.value_map
+                    .insert((input_ctx.clone(), inst), result_value);
                 self.func.append_to_block(new_block, result_value);
                 self.func.source_locs[result_value] = self.generic.source_locs[inst];
 
-                self.def_value(orig_block, input_ctx, inst, result_value, result_abs);
+                self.def_value(
+                    orig_block,
+                    input_ctx.clone(),
+                    inst,
+                    result_value,
+                    result_abs,
+                );
             }
         }
 
@@ -858,7 +874,7 @@ impl<'a> Evaluator<'a> {
     fn meet_into_block_entry(
         &mut self,
         _block: Block,
-        _context: Context,
+        _context: BTreeMap<Key, Context>,
         new_block: Block,
         state: &ProgPointState,
     ) -> bool {
@@ -868,8 +884,8 @@ impl<'a> Evaluator<'a> {
         self.state.block_entry[new_block].meet_with(&state)
     }
 
-    fn context_desc(&self, ctx: Context) -> String {
-        match self.state.contexts.leaf_element(ctx) {
+    fn context_desc(&self, key: Key, ctx: Context) -> String {
+        match self.state.contexts[key].leaf_element(ctx) {
             ContextElem::Root => "root".to_owned(),
             ContextElem::Loop(pc) => format!("PC {pc:?}"),
             ContextElem::Specialized(index, val) => format!("Specialization of {index}: {val}"),
@@ -879,27 +895,33 @@ impl<'a> Evaluator<'a> {
     fn create_block(
         &mut self,
         orig_block: Block,
-        context: Context,
+        context: BTreeMap<Key, Context>,
         mut state: ProgPointState,
     ) -> Block {
         state.update_across_edge();
         let block = self.func.add_block();
-        self.func.blocks[block].desc = format!(
-            "Orig {} ctx {} ({})",
-            orig_block,
-            context,
-            self.context_desc(context)
-        );
-        log::debug!("create_block: orig_block {orig_block} context {context} -> {block}");
+        self.func.blocks[block].desc = context
+            .iter()
+            .map(|(key, context)| {
+                format!(
+                    "{key} -> Orig {} ctx {} ({})",
+                    orig_block,
+                    context,
+                    self.context_desc(*key, *context)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        log::debug!("create_block: orig_block {orig_block} context {context:?} -> {block}");
         self.func.blocks[block]
             .params
             .reserve(self.generic.blocks[orig_block].params.len());
         for &(ty, param) in &self.generic.blocks[orig_block].params {
             let new_param = self.func.add_blockparam(block, ty);
             log::trace!(" -> blockparam {param} maps to {new_param}");
-            self.value_map.insert((context, param), new_param);
+            self.value_map.insert((context.clone(), param), new_param);
         }
-        self.block_map.insert((context, orig_block), block);
+        self.block_map.insert((context.clone(), orig_block), block);
         self.block_rev_map[block] = (context, orig_block);
         self.state.block_entry[block] = state;
         block
@@ -911,32 +933,34 @@ impl<'a> Evaluator<'a> {
         orig_block: Block,
         _new_block: Block,
         target: Block,
-        target_context: Context,
+        target_context: BTreeMap<Key, Context>,
     ) -> Block {
         log::debug!(
-            "targeting block {} from {}, in context {}",
+            "targeting block {} from {}, in context {:?}",
             target,
             orig_block,
             state.context
         );
 
-        log::trace!(" -> new context {target_context}");
+        log::trace!(" -> new context {target_context:?}");
 
         log::trace!(
-            "target_block: from orig {} ctx {} to {} ctx {}",
+            "target_block: from orig {} ctx {:?} to {} ctx {:?}",
             orig_block,
             state.context,
             target,
             target_context
         );
 
-        match self.block_map.entry((target_context, target)) {
+        match self.block_map.entry((target_context.clone(), target)) {
             HashEntry::Vacant(_) => {
-                let block = self.create_block(target, target_context, state.flow.clone());
+                let block = self.create_block(target, target_context.clone(), state.flow.clone());
                 log::trace!(" -> created block {block}");
-                self.block_map.insert((target_context, target), block);
-                self.queue_set.insert((target, target_context));
-                self.queue.push_back((target, target_context, block));
+                self.block_map
+                    .insert((target_context.clone(), target), block);
+                self.queue_set.insert((target, target_context.clone()));
+                self.queue
+                    .push_back((target, target_context.clone(), block));
                 block
             }
             HashEntry::Occupied(o) => {
@@ -944,15 +968,15 @@ impl<'a> Evaluator<'a> {
                 log::trace!(" -> already existing block {target_specialized}");
                 let changed = self.meet_into_block_entry(
                     target,
-                    target_context,
+                    target_context.clone(),
                     target_specialized,
                     &state.flow,
                 );
                 if changed {
                     log::trace!("   -> changed");
-                    if self.queue_set.insert((target, target_context)) {
+                    if self.queue_set.insert((target, target_context.clone())) {
                         self.queue
-                            .push_back((target, target_context, target_specialized));
+                            .push_back((target, target_context.clone(), target_specialized));
                     }
                 }
                 target_specialized
@@ -965,27 +989,32 @@ impl<'a> Evaluator<'a> {
         orig_block: Block,
         new_block: Block,
         state: &PointState,
-        target_ctx: Context,
+        target_ctx: BTreeMap<Key, Context>,
         target: &BlockTarget,
     ) -> BlockTarget {
         let n_args = self.generic.blocks[orig_block].params.len();
         let mut args = Vec::with_capacity(n_args);
         let mut abs_args = Vec::with_capacity(n_args);
         log::trace!(
-            "evaluate target: block {} context {} to {:?}",
+            "evaluate target: block {} context {:?} to {:?}",
             orig_block,
             state.context,
             target
         );
 
-        let target_block =
-            self.target_block(state, orig_block, new_block, target.block, target_ctx);
+        let target_block = self.target_block(
+            state,
+            orig_block,
+            new_block,
+            target.block,
+            target_ctx.clone(),
+        );
 
         for &arg in &target.args {
             let arg = self.generic.resolve_alias(arg);
-            let (val, abs) = self.use_value(state.context, orig_block, new_block, arg);
+            let (val, abs) = self.use_value(state.context.clone(), orig_block, new_block, arg);
             log::trace!(
-                "blockparam: block {} context {}: arg {} has val {} abs {:?}",
+                "blockparam: block {} context {:?}: arg {} has val {} abs {:?}",
                 orig_block,
                 state.context,
                 arg,
@@ -1006,25 +1035,31 @@ impl<'a> Evaluator<'a> {
             .zip(target.args.iter().zip(abs_args.iter()))
         {
             let orig_arg = self.generic.resolve_alias(*orig_arg);
-            let &val = self.value_map.get(&(target_ctx, blockparam)).unwrap();
+            let &val = self
+                .value_map
+                .get(&(target_ctx.clone(), blockparam))
+                .unwrap();
 
-            let abs = if let ContextElem::Specialized(index, val) =
-                self.state.contexts.leaf_element(target_ctx)
-            {
-                if index == blockparam {
-                    log::trace!(
-                        "Specialized context into block {target_block} context {target_ctx}: index {index} becomes val {val} from generic {orig_arg}",
+            let mut abs = abs.clone();
+            for (key, ctx) in &target_ctx {
+                abs = if let ContextElem::Specialized(index, val) =
+                    self.state.contexts[*key].leaf_element(*ctx)
+                {
+                    if index == blockparam {
+                        log::trace!(
+                        "Specialized context into block {target_block} context {target_ctx:?}: index {index} becomes val {val} from generic {orig_arg}",
                     );
-                    AbstractValue::Concrete(WasmVal::I32(val))
+                        AbstractValue::Concrete(WasmVal::I32(val))
+                    } else {
+                        abs
+                    }
                 } else {
-                    abs.clone()
-                }
-            } else {
-                abs.clone()
-            };
+                    abs
+                };
+            }
 
             log::debug!(
-                "blockparam: updating with new def: block {} context {} param {} val {} abstract {:?} from arg {}",
+                "blockparam: updating with new def: block {} context {:?} param {} val {} abstract {:?} from arg {}",
                 target.block,
                 target_ctx,
                 blockparam,
@@ -1032,7 +1067,7 @@ impl<'a> Evaluator<'a> {
                 abs,
                 orig_arg,
             );
-            changed |= self.def_value(orig_block, target_ctx, blockparam, val, abs);
+            changed |= self.def_value(orig_block, target_ctx.clone(), blockparam, val, abs);
         }
 
         // If blockparam inputs changed, re-enqueue target for evaluation.
@@ -1048,14 +1083,18 @@ impl<'a> Evaluator<'a> {
 
     fn evaluate_term(&mut self, orig_block: Block, state: &mut PointState, new_block: Block) {
         log::trace!(
-            "evaluating terminator: block {} context {} specialized block {}: {:?}",
+            "evaluating terminator: block {} context {:?} specialized block {}: {:?}",
             orig_block,
             state.context,
             new_block,
             self.generic.blocks[orig_block].terminator
         );
 
-        let new_context = state.pending_context.unwrap_or(state.context);
+        let new_context = state
+            .pending_context
+            .as_ref()
+            .unwrap_or(&state.context)
+            .clone();
 
         let new_term = match &self.generic.blocks[orig_block].terminator {
             &Terminator::None => Terminator::None,
@@ -1065,7 +1104,8 @@ impl<'a> Evaluator<'a> {
                 ref if_false,
             } => {
                 assert!(!state.pending_specialize.is_some());
-                let (cond, abs_cond) = self.use_value(state.context, orig_block, new_block, cond);
+                let (cond, abs_cond) =
+                    self.use_value(state.context.clone(), orig_block, new_block, cond);
                 // Update pending context with new stack if necessary.
                 match abs_cond.as_const_truthy() {
                     Some(true) => Terminator::Br {
@@ -1092,7 +1132,7 @@ impl<'a> Evaluator<'a> {
                             orig_block,
                             new_block,
                             state,
-                            new_context,
+                            new_context.clone(),
                             if_true,
                         ),
                         if_false: self.evaluate_block_target(
@@ -1117,16 +1157,25 @@ impl<'a> Evaluator<'a> {
                         self.generic.blocks[target.block].params[index_of_value].1;
                     let mut targets: Vec<BlockTarget> = (lo..=hi)
                         .map(|i| {
-                            let c = self.state.contexts.create(
-                                Some(new_context),
-                                ContextElem::Specialized(target_specialized_value, i),
-                            );
-                            log::trace!(" -> created new context {c} for index {i}");
+                            let c: BTreeMap<Key, Context> = new_context
+                                .iter()
+                                .map(|(key, new_context)| {
+                                    (
+                                        *key,
+                                        self.state.contexts[*key].create(
+                                            Some(*new_context),
+                                            ContextElem::Specialized(target_specialized_value, i),
+                                        ),
+                                    )
+                                })
+                                .collect();
+                            log::trace!(" -> created new context {c:?} for index {i}");
                             self.evaluate_block_target(orig_block, new_block, state, c, target)
                         })
                         .collect();
                     let default = targets.pop().unwrap();
-                    let (value, _) = self.use_value(state.context, orig_block, new_block, index);
+                    let (value, _) =
+                        self.use_value(state.context.clone(), orig_block, new_block, index);
                     Terminator::Select {
                         value,
                         targets,
@@ -1152,7 +1201,7 @@ impl<'a> Evaluator<'a> {
             } => {
                 assert!(!state.pending_specialize.is_some());
                 let (value, abs_value) =
-                    self.use_value(state.context, orig_block, new_block, value);
+                    self.use_value(state.context.clone(), orig_block, new_block, value);
                 if let Some(selector) = abs_value.as_const_u32() {
                     let selector = selector as usize;
                     let target = if selector < targets.len() {
@@ -1177,7 +1226,7 @@ impl<'a> Evaluator<'a> {
                                 orig_block,
                                 new_block,
                                 state,
-                                new_context,
+                                new_context.clone(),
                                 target,
                             )
                         })
@@ -1186,7 +1235,7 @@ impl<'a> Evaluator<'a> {
                         orig_block,
                         new_block,
                         state,
-                        new_context,
+                        new_context.clone(),
                         default,
                     );
                     Terminator::Select {
@@ -1200,7 +1249,7 @@ impl<'a> Evaluator<'a> {
                 let values = values
                     .iter()
                     .map(|&value| {
-                        self.use_value(state.context, orig_block, new_block, value)
+                        self.use_value(state.context.clone(), orig_block, new_block, value)
                             .0
                     })
                     .collect::<Vec<_>>();
@@ -1287,43 +1336,83 @@ impl<'a> Evaluator<'a> {
         match op {
             Operator::Call { function_index } => {
                 if Some(function_index) == self.intrinsics.push_context {
-                    let pc = abs[0]
+                    let key = Key::new(
+                        abs[0]
+                            .as_const_u32_or_mem_offset()
+                            .expect("key should not be a runtime value"),
+                    );
+                    let pc = abs[1]
                         .as_const_u32_or_mem_offset()
                         .expect("PC should not be a runtime value");
-                    let instantaneous_context = state.pending_context.unwrap_or(state.context);
-                    let child = self
-                        .state
-                        .contexts
-                        .create(Some(instantaneous_context), ContextElem::Loop(pc));
-                    state.pending_context = Some(child);
+                    let mut instantaneous_context = state
+                        .pending_context
+                        .as_ref()
+                        .unwrap_or(&state.context)
+                        .clone();
+                    let child = self.state.contexts[key].create(
+                        instantaneous_context.get(&key).cloned(),
+                        ContextElem::Loop(pc),
+                    );
+                    instantaneous_context.insert(key, child);
+                    state.pending_context = Some(instantaneous_context);
                     log::trace!("push context (pc {pc:?}): now {child}");
                     EvalResult::Elide
                 } else if Some(function_index) == self.intrinsics.pop_context {
-                    let instantaneous_context = state.pending_context.unwrap_or(state.context);
-                    let parent = self.state.contexts.pop_one_loop(instantaneous_context);
-                    state.pending_context = Some(parent);
+                    let key = Key::new(
+                        abs[0]
+                            .as_const_u32_or_mem_offset()
+                            .expect("key should not be a runtime value"),
+                    );
+                    let mut instantaneous_context = state
+                        .pending_context
+                        .as_ref()
+                        .unwrap_or(&state.context)
+                        .clone();
+                    let parent = self.state.contexts[key]
+                        .pop_one_loop(*instantaneous_context.get(&key).expect("to exist"));
+                    instantaneous_context.insert(key, parent);
+                    state.pending_context = Some(instantaneous_context);
                     log::trace!("pop context: now {parent}");
                     EvalResult::Elide
                 } else if Some(function_index) == self.intrinsics.update_context {
-                    log::trace!("update context at {}: PC is {:?}", orig_values[0], abs[0]);
-                    let instantaneous_context = state.pending_context.unwrap_or(state.context);
-                    let parent = self.state.contexts.pop_one_loop(instantaneous_context);
-                    let pending_context = if let Some(pc) = abs[0].as_const_u32_or_mem_offset() {
-                        Some(
-                            self.state
-                                .contexts
-                                .create(Some(parent), ContextElem::Loop(pc)),
-                        )
+                    let key = Key::new(
+                        abs[0]
+                            .as_const_u32_or_mem_offset()
+                            .expect("key should not be a runtime value"),
+                    );
+                    log::trace!("update context at {}: PC is {:?}", orig_values[0], abs[1]);
+                    let mut instantaneous_context = state
+                        .pending_context
+                        .as_ref()
+                        .unwrap_or(&state.context)
+                        .clone();
+                    let parent = self.state.contexts[key]
+                        .pop_one_loop(*instantaneous_context.get(&key).expect("to exist"));
+                    let pending_context = if let Some(pc) = abs[1].as_const_u32_or_mem_offset() {
+                        Some(self.state.contexts[key].create(Some(parent), ContextElem::Loop(pc)))
                     } else {
-                        panic!("PC is a runtime value: {:?}", abs[0]);
+                        panic!("PC is a runtime value: {:?}", abs[1]);
                     };
                     log::trace!("update context: now {pending_context:?}");
-                    state.pending_context = pending_context;
+                    if let Some(pending_context) = pending_context {
+                        instantaneous_context.insert(key, pending_context);
+                        state.pending_context = Some(instantaneous_context);
+                    }
                     EvalResult::Elide
                 } else if Some(function_index) == self.intrinsics.context_bucket {
-                    let instantaneous_context = state.pending_context.unwrap_or(state.context);
-                    let bucket = abs[0].as_const_u32().unwrap();
-                    self.state.contexts.context_bucket[instantaneous_context] = Some(bucket);
+                    let key = Key::new(
+                        abs[0]
+                            .as_const_u32_or_mem_offset()
+                            .expect("key should not be a runtime value"),
+                    );
+                    let instantaneous_context = state
+                        .pending_context
+                        .as_ref()
+                        .unwrap_or(&state.context)
+                        .clone();
+                    let bucket = abs[1].as_const_u32().unwrap();
+                    self.state.contexts[key].context_bucket
+                        [*instantaneous_context.get(&key).expect("to exist")] = Some(bucket);
                     EvalResult::Elide
                 } else if Some(function_index) == self.intrinsics.specialize_value {
                     let lo = abs[1].as_const_u32().unwrap();
@@ -1344,7 +1433,7 @@ impl<'a> Evaluator<'a> {
                 } else if Some(function_index) == self.intrinsics.trace_line {
                     let line_num = abs[0].as_const_u32().unwrap_or(0);
                     log::debug!(
-                        "trace: line number {}: current context {} at block {}, pending context {:?}",
+                        "trace: line number {}: current context {:?} at block {}, pending context {:?}",
                         line_num,
                         state.context,
                         orig_block,
@@ -1362,8 +1451,13 @@ impl<'a> Evaluator<'a> {
                     EvalResult::Elide
                 } else if Some(function_index) == self.intrinsics.assert_specialized {
                     log::trace!("assert_specialized: context {:?}", state.context);
-                    if state.context.index() == 0 {
-                        panic!("weval_assert_specialized() failed: line {:?}", abs[0]);
+                    let key = Key::new(
+                        abs[0]
+                            .as_const_u32_or_mem_offset()
+                            .expect("key should not be a runtime value"),
+                    );
+                    if state.context.get(&key).is_none_or(|a| a.index() == 0) {
+                        panic!("weval_assert_specialized() failed: line {:?}", abs[1]);
                     }
                     EvalResult::Elide
                 } else if Some(function_index) == self.intrinsics.print {
@@ -1388,6 +1482,11 @@ impl<'a> Evaluator<'a> {
                     log::trace!("read_specialization_global: index {index}: state = {state:?}");
                     EvalResult::Alias(state, value)
                 } else if Some(function_index) == self.intrinsics.push_stack {
+                    let key = Key::new(
+                        abs[0]
+                            .as_const_u32_or_mem_offset()
+                            .expect("key should not be a runtime value"),
+                    );
                     let stackptr = self.func.arg_pool[values][0];
                     let value = self.func.arg_pool[values][1];
                     log::trace!(
@@ -1396,35 +1495,40 @@ impl<'a> Evaluator<'a> {
                         state.flow.stack,
                     );
                     log::trace!("push_stack: value {value} stackptr {stackptr}");
-                    state.flow.stack.insert(
+                    state.flow.stack.entry(key).or_default().insert(
                         0,
                         (
                             RegValue::Value {
                                 data: stackptr,
                                 ty: Type::I32,
-                                abs: abs[0].clone(),
+                                abs: abs[1].clone(),
                             },
                             RegValue::Value {
                                 data: value,
                                 ty: Type::I64,
-                                abs: abs[1].clone(),
+                                abs: abs[2].clone(),
                             },
                         ),
                     );
                     self.stats.virtstack_writes += 1;
                     EvalResult::Elide
                 } else if Some(function_index) == self.intrinsics.pop_stack {
+                    let key = Key::new(
+                        abs[0]
+                            .as_const_u32_or_mem_offset()
+                            .expect("key should not be a runtime value"),
+                    );
                     log::trace!("pop_stack: current stack is {:?}", state.flow.stack);
                     self.stats.virtstack_reads += 1;
-                    if state.flow.stack.len() > 0 {
-                        let (_, reg) = state.flow.stack.remove(0);
+                    if state.flow.stack.entry(key).or_default().len() > 0 {
+                        let (_, reg) = state.flow.stack.entry(key).or_default().remove(0);
                         let (value, abs) = match reg {
                             RegValue::Value { data, abs, .. } => (data, abs),
                             _ => unreachable!(),
                         };
                         EvalResult::Alias(abs, value)
                     } else {
-                        let ptr = self.func.arg_pool[values][0];
+                        let ptr = self.func.arg_pool[values][1];
                         let load = self.func.add_op(
                             new_block,
                             Operator::I64Load {
@@ -1441,21 +1545,28 @@ impl<'a> Evaluator<'a> {
                         EvalResult::Alias(AbstractValue::Runtime(None), load)
                     }
                 } else if Some(function_index) == self.intrinsics.read_stack {
-                    let idx = abs[1].as_const_u32().unwrap();
+                    let key = Key::new(
+                        abs[0]
+                            .as_const_u32_or_mem_offset()
+                            .expect("key should not be a runtime value"),
+                    );
+                    let idx = abs[2].as_const_u32().unwrap();
                     log::trace!(
                         "read_stack: index {}, current stack is {:?}",
                         idx,
                         state.flow.stack
                     );
                     self.stats.virtstack_reads += 1;
-                    if let Some((_, data)) = state.flow.stack.get(idx as usize) {
+                    if let Some((_, data)) =
+                        state.flow.stack.entry(key).or_default().get(idx as usize)
+                    {
                         let (value, abs) = match data {
                             RegValue::Value { data, abs, .. } => (*data, abs.clone()),
                             _ => unreachable!(),
                         };
                         EvalResult::Alias(abs, value)
                     } else {
-                        let ptr = self.func.arg_pool[values][0];
+                        let ptr = self.func.arg_pool[values][1];
                         let load = self.func.add_op(
                             new_block,
                             Operator::I64Load {
@@ -1472,9 +1583,14 @@ impl<'a> Evaluator<'a> {
                         EvalResult::Alias(AbstractValue::Runtime(None), load)
                     }
                 } else if Some(function_index) == self.intrinsics.write_stack {
-                    let stackptr = self.func.arg_pool[values][0];
-                    let idx = abs[1].as_const_u32().unwrap();
-                    let value = self.func.arg_pool[values][2];
+                    let key = Key::new(
+                        abs[0]
+                            .as_const_u32_or_mem_offset()
+                            .expect("key should not be a runtime value"),
+                    );
+                    let stackptr = self.func.arg_pool[values][1];
+                    let idx = abs[2].as_const_u32().unwrap();
+                    let value = self.func.arg_pool[values][3];
                     log::trace!(
                         "write_stack: index {}, value {}, current stack is {:?}",
                         idx,
@@ -1483,21 +1599,32 @@ impl<'a> Evaluator<'a> {
                     );
                     let addr_value = RegValue::Value {
                         data: stackptr,
-                        abs: abs[0].clone(),
+                        abs: abs[1].clone(),
                         ty: Type::I32,
                     };
                     let data_value = RegValue::Value {
                         data: value,
-                        abs: abs[2].clone(),
+                        abs: abs[3].clone(),
                         ty: Type::I64,
                     };
                     self.stats.virtstack_writes += 1;
-                    if let Some((addr, data)) = state.flow.stack.get_mut(idx as usize) {
+                    if let Some((addr, data)) = state
+                        .flow
+                        .stack
+                        .entry(key)
+                        .or_default()
+                        .get_mut(idx as usize)
+                    {
                         log::trace!("write_stack: value {value} stackptr {stackptr}");
                         *addr = addr_value;
                         *data = data_value;
                     } else if idx == 0 && state.flow.stack.is_empty() {
-                        state.flow.stack.push((addr_value, data_value));
+                        state
+                            .flow
+                            .stack
+                            .entry(key)
+                            .or_default()
+                            .push((addr_value, data_value));
                     } else {
                         self.func.add_op(
                             new_block,
@@ -1515,9 +1642,14 @@ impl<'a> Evaluator<'a> {
                     }
                     EvalResult::Elide
                 } else if Some(function_index) == self.intrinsics.sync_stack {
+                    let key = Key::new(
+                        abs[0]
+                            .as_const_u32_or_mem_offset()
+                            .expect("key should not be a runtime value"),
+                    );
                     log::trace!("sync_stack current stack is {:?}", state.flow.stack);
 
-                    for (addr, data) in state.flow.stack.drain(..) {
+                    for (addr, data) in state.flow.stack.entry(key).or_default().drain(..) {
                         let addr = addr.value().unwrap();
                         let data = data.value().unwrap();
                         log::trace!("sync_stack: value {addr} stackptr {data}");
@@ -1536,7 +1668,9 @@ impl<'a> Evaluator<'a> {
                         self.stats.virtstack_writes_mem += 1;
                     }
 
-                    for (_, (addr, data)) in std::mem::take(&mut state.flow.locals) {
+                    for (_, (addr, data)) in
+                        std::mem::take(state.flow.locals.entry(key).or_default())
+                    {
                         let addr = addr.value().unwrap();
                         let data = data.value().unwrap();
                         log::trace!("sync_stack: local addr {addr} data {data}");
@@ -1556,10 +1690,15 @@ impl<'a> Evaluator<'a> {
                     }
                     EvalResult::Elide
                 } else if Some(function_index) == self.intrinsics.read_local {
+                    let key = Key::new(
+                        abs[0]
+                            .as_const_u32_or_mem_offset()
+                            .expect("key should not be a runtime value"),
+                    );
                     self.stats.local_reads += 1;
-                    let ptr = self.func.arg_pool[values][0];
-                    let idx = abs[1].as_const_u32().unwrap();
-                    match state.flow.locals.get(&idx) {
+                    let ptr = self.func.arg_pool[values][1];
+                    let idx = abs[2].as_const_u32().unwrap();
+                    match state.flow.locals.entry(key).or_default().get(&idx) {
                         None => {
                             let load = self.func.add_op(
                                 new_block,
@@ -1582,21 +1721,26 @@ impl<'a> Evaluator<'a> {
                         _ => unreachable!(),
                     }
                 } else if Some(function_index) == self.intrinsics.write_local {
+                    let key = Key::new(
+                        abs[0]
+                            .as_const_u32_or_mem_offset()
+                            .expect("key should not be a runtime value"),
+                    );
                     self.stats.local_writes += 1;
-                    let ptr = self.func.arg_pool[values][0];
-                    let idx = abs[1].as_const_u32().unwrap();
-                    let data = self.func.arg_pool[values][2];
-                    state.flow.locals.insert(
+                    let ptr = self.func.arg_pool[values][1];
+                    let idx = abs[2].as_const_u32().unwrap();
+                    let data = self.func.arg_pool[values][3];
+                    state.flow.locals.entry(key).or_default().insert(
                         idx,
                         (
                             RegValue::Value {
                                 data: ptr,
-                                abs: abs[0].clone(),
+                                abs: abs[1].clone(),
                                 ty: Type::I32,
                             },
                             RegValue::Value {
                                 data,
-                                abs: abs[2].clone(),
+                                abs: abs[3].clone(),
                                 ty: Type::I64,
                             },
                         ),
@@ -1624,9 +1768,14 @@ impl<'a> Evaluator<'a> {
             Operator::Call { function_index }
                 if Some(function_index) == self.intrinsics.read_reg =>
             {
-                let idx = abs[0].as_const_u64().expect("Non-constant register number");
+                let key = Key::new(
+                    abs[0]
+                        .as_const_u32_or_mem_offset()
+                        .expect("key should not be a runtime value"),
+                );
+                let idx = abs[1].as_const_u64().expect("Non-constant register number");
                 log::trace!("load from specialization reg {idx}");
-                let slot = RegSlot::Register(idx as u32);
+                let slot = RegSlot::Register(idx as u32, key);
                 match state.flow.regs.get(&slot) {
                     Some(RegValue::Value { data, abs, .. }) => {
                         log::trace!(" -> have value {data} with abs {abs:?}");
@@ -1643,21 +1792,26 @@ impl<'a> Evaluator<'a> {
             Operator::Call { function_index }
                 if Some(function_index) == self.intrinsics.write_reg =>
             {
-                let idx = abs[0].as_const_u64().expect("Non-constant register number");
-                let data = self.func.arg_pool[vals][1];
+                let key = Key::new(
+                    abs[0]
+                        .as_const_u32_or_mem_offset()
+                        .expect("key should not be a runtime value"),
+                );
+                let idx = abs[1].as_const_u64().expect("Non-constant register number");
+                let data = self.func.arg_pool[vals][2];
                 log::trace!(
                     "store to specialization reg {} value {} abs {:?}",
                     idx,
                     data,
-                    abs[1]
+                    abs[2]
                 );
-                let slot = RegSlot::Register(idx as u32);
+                let slot = RegSlot::Register(idx as u32, key);
                 state.flow.regs.insert(
                     slot,
                     RegValue::Value {
                         data,
                         ty: Type::I64,
-                        abs: abs[1].clone(),
+                        abs: abs[2].clone(),
                     },
                 );
 
@@ -2162,16 +2316,16 @@ impl<'a> Evaluator<'a> {
         // Examine regs in block input state of each
         // specialized block, and create blockparams for all values
         // that in the end were `BlockParam`.
-        for (&(ctx, orig_block), &block) in &self.block_map {
+        for (&(ref ctx, orig_block), &block) in &self.block_map {
             let succ_state = &self.state.block_entry[block];
 
             let mut regs = vec![];
             let mut handle_value = |idx: RegSlot, val: &RegValue| -> anyhow::Result<()> {
                 let ty = val.ty();
                 let val_blockparam = self.func.add_blockparam(block, ty);
-                let orig_val = *self.reg_map.get(&(ctx, orig_block, idx)).ok_or_else(|| {
+                let orig_val = *self.reg_map.get(&(ctx.clone(), orig_block, idx)).ok_or_else(|| {
                     anyhow::anyhow!(
-                        "placeholder val not found for reg idx {idx:?} at block {block} (ctx {ctx} orig {orig_block})",
+                        "placeholder val not found for reg idx {idx:?} at block {block} (ctx {ctx:?} orig {orig_block})",
                     )
                 })?;
                 self.func.set_alias(orig_val, val_blockparam);
@@ -2182,13 +2336,17 @@ impl<'a> Evaluator<'a> {
             for (&idx, val) in &succ_state.regs {
                 handle_value(idx, val)?;
             }
-            for (i, (addr, data)) in succ_state.stack.iter().enumerate() {
-                handle_value(RegSlot::StackAddr(i as u32), addr)?;
-                handle_value(RegSlot::StackData(i as u32), data)?;
+            for (key, value) in succ_state.stack.iter() {
+                for (i, (addr, data)) in value.iter().enumerate() {
+                    handle_value(RegSlot::StackAddr(i as u32, *key), addr)?;
+                    handle_value(RegSlot::StackData(i as u32, *key), data)?;
+                }
             }
-            for (&i, (addr, data)) in succ_state.locals.iter() {
-                handle_value(RegSlot::LocalAddr(i), addr)?;
-                handle_value(RegSlot::LocalData(i), data)?;
+            for (key, value) in succ_state.locals.iter() {
+                for (&i, (addr, data)) in value.iter() {
+                    handle_value(RegSlot::LocalAddr(i, *key), addr)?;
+                    handle_value(RegSlot::LocalData(i, *key), data)?;
+                }
             }
 
             for pred_idx in 0..self.func.blocks[block].preds.len() {
@@ -2198,11 +2356,39 @@ impl<'a> Evaluator<'a> {
 
                 for &idx in &regs {
                     let pred_reg = match idx {
-                        RegSlot::Register(_) => pred_state.regs.get(&idx).as_ref().unwrap(),
-                        RegSlot::StackAddr(i) => &pred_state.stack.get(i as usize).unwrap().0,
-                        RegSlot::StackData(i) => &pred_state.stack.get(i as usize).unwrap().1,
-                        RegSlot::LocalAddr(i) => &pred_state.locals.get(&i).unwrap().0,
-                        RegSlot::LocalData(i) => &pred_state.locals.get(&i).unwrap().1,
+                        RegSlot::Register(_, key) => pred_state.regs.get(&idx).as_ref().unwrap(),
+                        RegSlot::StackAddr(i, key) => {
+                            &pred_state
+                                .stack
+                                .get(&key)
+                                .and_then(|a| a.get(i as usize))
+                                .unwrap()
+                                .0
+                        }
+                        RegSlot::StackData(i, key) => {
+                            &pred_state
+                                .stack
+                                .get(&key)
+                                .and_then(|a| a.get(i as usize))
+                                .unwrap()
+                                .1
+                        }
+                        RegSlot::LocalAddr(i, key) => {
+                            &pred_state
+                                .locals
+                                .get(&key)
+                                .and_then(|a| a.get(&i))
+                                .unwrap()
+                                .0
+                        }
+                        RegSlot::LocalData(i, key) => {
+                            &pred_state
+                                .locals
+                                .get(&key)
+                                .and_then(|a| a.get(&i))
+                                .unwrap()
+                                .1
+                        }
                     };
                     let pred_val = pred_reg.value().unwrap();
                     self.func.blocks[pred]
@@ -2230,62 +2416,88 @@ impl<'a> Evaluator<'a> {
             }
 
             let pred_state = &self.state.block_exit[block];
-            let pred_depth = pred_state.stack.len();
-            let succ_min_depth = self.func.blocks[block]
+            let keys = self.func.blocks[block]
                 .succs
                 .iter()
-                .map(|succ| self.state.block_entry[*succ].stack.len())
-                .min()
-                .unwrap();
-
-            for i in succ_min_depth..pred_depth {
-                let addr = pred_state.stack[i].0.value().unwrap();
-                let data = pred_state.stack[i].1.value().unwrap();
-                log::trace!("spilling {i} back to real stack memory: addr {addr} data {data}");
-                self.func.add_op(
-                    block,
-                    Operator::I64Store {
-                        memory: MemoryArg {
-                            align: 1,
-                            offset: 0,
-                            memory: self.image.main_heap().unwrap(),
-                        },
-                    },
-                    &[addr, data],
-                    &[],
-                );
-            }
-
-            let locals_to_sync = pred_state
-                .locals
-                .keys()
-                .filter(|key| {
-                    self.func.blocks[block]
-                        .succs
-                        .iter()
-                        .any(|succ| !self.state.block_entry[*succ].locals.contains_key(key))
+                .flat_map(|a| {
+                    self.state.block_entry[*a]
+                        .stack
+                        .keys()
+                        .chain(self.state.block_entry[*a].locals.keys())
                 })
+                .chain(pred_state.stack.keys())
+                .chain(pred_state.locals.keys())
                 .cloned()
-                .collect::<Vec<_>>();
-            for local in locals_to_sync {
-                let (addr, data) = pred_state.locals.get(&local).unwrap();
-                let addr = addr.value().unwrap();
-                let data = data.value().unwrap();
-                log::trace!(
+                .collect::<BTreeSet<_>>();
+            for key in keys {
+                let pred_depth = pred_state.stack.get(&key).map(|a| a.len()).unwrap_or(0);
+                let succ_min_depth = self.func.blocks[block]
+                    .succs
+                    .iter()
+                    .map(|succ| {
+                        self.state.block_entry[*succ]
+                            .stack
+                            .get(&key)
+                            .map(|a| a.len())
+                            .unwrap_or(0)
+                    })
+                    .min()
+                    .unwrap();
+
+                for i in succ_min_depth..pred_depth {
+                    let addr = pred_state.stack.get(&key).unwrap()[i].0.value().unwrap();
+                    let data = pred_state.stack.get(&key).unwrap()[i].1.value().unwrap();
+                    log::trace!("spilling {i} back to real stack memory: addr {addr} data {data}");
+                    self.func.add_op(
+                        block,
+                        Operator::I64Store {
+                            memory: MemoryArg {
+                                align: 1,
+                                offset: 0,
+                                memory: self.image.main_heap().unwrap(),
+                            },
+                        },
+                        &[addr, data],
+                        &[],
+                    );
+                }
+
+                let locals_to_sync = pred_state
+                    .locals
+                    .get(&key)
+                    .iter()
+                    .flat_map(|a| {
+                        a.keys().filter(|key2| {
+                            self.func.blocks[block].succs.iter().any(|succ| {
+                                !self.state.block_entry[*succ]
+                                    .locals
+                                    .get(&key)
+                                    .is_some_and(|a| a.contains_key(key2))
+                            })
+                        })
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for local in locals_to_sync {
+                    let (addr, data) = pred_state.locals.get(&key).unwrap().get(&local).unwrap();
+                    let addr = addr.value().unwrap();
+                    let data = data.value().unwrap();
+                    log::trace!(
                     "spilling local {local} back to real locals memory: addr {addr} data {data}"
                 );
-                self.func.add_op(
-                    block,
-                    Operator::I64Store {
-                        memory: MemoryArg {
-                            align: 1,
-                            offset: 0,
-                            memory: self.image.main_heap().unwrap(),
+                    self.func.add_op(
+                        block,
+                        Operator::I64Store {
+                            memory: MemoryArg {
+                                align: 1,
+                                offset: 0,
+                                memory: self.image.main_heap().unwrap(),
+                            },
                         },
-                    },
-                    &[addr, data],
-                    &[],
-                );
+                        &[addr, data],
+                        &[],
+                    );
+                }
             }
         }
     }
